@@ -22,13 +22,16 @@ class MainActivity : Activity() {
     private val reqOverlay = 1
     private val reqCapture = 2
 
-    // label -> OCR script code
+    private data class Src(val label: String, val script: String, val latin: String)
+
+    // OCR script + which language Latin-letter text is assumed to be ("auto" = detect)
     private val sources = listOf(
-        "Latin (English, French, German, Spanish, Turkish...)" to "latin",
-        "Chinese" to "zh",
-        "Japanese" to "ja",
-        "Korean" to "ko",
-        "Devanagari (Hindi, Marathi, Nepali)" to "dev"
+        Src("English", "latin", "en"),
+        Src("Chinese + English", "zh", "en"),
+        Src("Japanese + English", "ja", "en"),
+        Src("Korean + English", "ko", "en"),
+        Src("Hindi + English", "dev", "en"),
+        Src("Other Latin languages (French, German, Spanish...) - auto-detect", "latin", "auto")
     )
 
     // label -> ML Kit translate language code
@@ -62,9 +65,9 @@ class MainActivity : Activity() {
         fun label(t: String) = TextView(this).apply { text = t; textSize = 16f; setPadding(0, pad / 2, 0, 0) }
 
         root.addView(TextView(this).apply { text = "Screen Translate"; textSize = 26f })
-        root.addView(label("Text language on screen (OCR):"))
+        root.addView(label("Language on screen (OCR):"))
         srcSpinner = Spinner(this).apply {
-            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, sources.map { it.first })
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, sources.map { it.label })
         }
         root.addView(srcSpinner)
         root.addView(label("Translate to:"))
@@ -72,12 +75,13 @@ class MainActivity : Activity() {
             adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, targets.map { it.first })
         }
         root.addView(tgtSpinner)
-        srcSpinner.setSelection(prefs.getInt("src", 0))
-        tgtSpinner.setSelection(prefs.getInt("tgt", 0))
+
+        srcSpinner.setSelection(prefs.getInt("src2", 0).coerceIn(0, sources.size - 1))
+        tgtSpinner.setSelection(prefs.getInt("tgt", 0).coerceIn(0, targets.size - 1))
         val changed = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
                 prefs.edit()
-                    .putInt("src", srcSpinner.selectedItemPosition)
+                    .putInt("src2", srcSpinner.selectedItemPosition)
                     .putInt("tgt", tgtSpinner.selectedItemPosition)
                     .apply()
                 sendConfig()
@@ -86,12 +90,16 @@ class MainActivity : Activity() {
         }
         srcSpinner.onItemSelectedListener = changed
         tgtSpinner.onItemSelectedListener = changed
+
         root.addView(Button(this).apply {
             text = "Start floating button"
             setOnClickListener { start() }
         })
         root.addView(TextView(this).apply {
-            text = "Tap the floating button to translate the screen. Tap again to hide the translation. Long-press (1.5s) the button to quit.\n\nTo change the languages while it is running: open this app and pick another language - it applies instantly."
+            text = "Tap the floating button to turn LIVE translation on (it turns green). Tap again to turn it off. " +
+                "Long-press (1.5s) the button to quit.\n\n" +
+                "To change languages while it is running: open this app and pick another language - it applies instantly.\n\n" +
+                "Live mode uses battery. Turn it off when you do not need it."
             setPadding(0, pad, 0, 0)
         })
         setContentView(root)
@@ -101,15 +109,17 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun withConfig(i: Intent): Intent {
+        val s = sources[srcSpinner.selectedItemPosition]
+        return i.putExtra("script", s.script)
+            .putExtra("latin", s.latin)
+            .putExtra("target", targets[tgtSpinner.selectedItemPosition].second)
+    }
+
     // Apply language changes immediately to the running floating-button service
     private fun sendConfig() {
         if (!OverlayService.running) return
-        startService(
-            Intent(this, OverlayService::class.java)
-                .setAction(OverlayService.ACTION_CONFIG)
-                .putExtra("script", sources[srcSpinner.selectedItemPosition].second)
-                .putExtra("target", targets[tgtSpinner.selectedItemPosition].second)
-        )
+        startService(withConfig(Intent(this, OverlayService::class.java).setAction(OverlayService.ACTION_CONFIG)))
     }
 
     private fun start() {
@@ -138,11 +148,11 @@ class MainActivity : Activity() {
         when (requestCode) {
             reqOverlay -> if (Settings.canDrawOverlays(this)) requestCapture()
             reqCapture -> if (resultCode == RESULT_OK && data != null) {
-                val svc = Intent(this, OverlayService::class.java)
-                    .putExtra("code", resultCode)
-                    .putExtra("data", data)
-                    .putExtra("script", sources[srcSpinner.selectedItemPosition].second)
-                    .putExtra("target", targets[tgtSpinner.selectedItemPosition].second)
+                val svc = withConfig(
+                    Intent(this, OverlayService::class.java)
+                        .putExtra("code", resultCode)
+                        .putExtra("data", data)
+                )
                 startForegroundService(svc)
                 moveTaskToBack(true)
             }

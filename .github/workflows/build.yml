@@ -6,9 +6,9 @@ permissions:
   contents: write
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Unpack uploaded zip
         run: |
           if [ -f ScreenTranslate.zip ]; then
@@ -21,7 +21,7 @@ jobs:
             git commit -m "Unpack project"
             git push
           fi
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: 17

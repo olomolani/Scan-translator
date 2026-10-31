@@ -50,12 +50,14 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlin.math.abs
 
 class OverlayService : Service() {
@@ -65,6 +67,9 @@ class OverlayService : Service() {
         const val ACTION_CONFIG = "com.example.screentranslate.CONFIG"
         @Volatile var running = false
         private const val BUTTON_DP = 56
+        private const val SIG_W = 54
+        private const val SIG_H = 96
+        private const val VERIFY_MS = 5000L
         private val BLUE = 0xDD1565C0.toInt()
         private val GREEN = 0xDD2E7D32.toInt()
     }
@@ -79,6 +84,7 @@ class OverlayService : Service() {
     private var reader: ImageReader? = null
     private var vDisplay: VirtualDisplay? = null
     private var latest: Image? = null
+    private var frameCount = 0L
 
     private var button: TextView? = null
     private var buttonBg: GradientDrawable? = null
@@ -90,13 +96,24 @@ class OverlayService : Service() {
     private var targetLang = TranslateLanguage.PERSIAN
     private var latinLang: String? = TranslateLanguage.ENGLISH   // null = auto-detect
     private var hanLang = TranslateLanguage.CHINESE
+    private var maxSide = 1800
     private val translators = HashMap<String, Translator>()
     private val ready = HashSet<String>()
     private val cache = HashMap<String, String>()
     private val langId = LanguageIdentification.getClient()
 
+    // live state
     private var live = false
     private var liveJob: Job? = null
+    private var shown = false            // translations currently visible
+    private var dirty = false            // user touched the screen / settings changed
+    private var cleanPending = false     // we hid the overlay and need a fresh frame
+    private var hideFrame = 0L
+    private var lastItems: List<Item>? = null
+    private var lastCleanSig: IntArray? = null
+    private var refSig: IntArray? = null
+    private var shownAt = 0L
+
     private var lastError: String? = null
     private var errorToastAt = 0L
     private var screenW = 0
@@ -110,7 +127,7 @@ class OverlayService : Service() {
             stopSelf(); return START_NOT_STICKY
         }
         if (intent.action == ACTION_CONFIG) {
-            if (projection == null) stopSelf() else readConfig(intent)
+            if (projection == null) stopSelf() else { readConfig(intent); invalidate() }
             return START_NOT_STICKY
         }
         startAsForeground()
@@ -151,6 +168,14 @@ class OverlayService : Service() {
             setRecognizer(it)
             hanLang = if (it == "ja") TranslateLanguage.JAPANESE else TranslateLanguage.CHINESE
         }
+        val q = intent.getIntExtra("quality", -1)
+        if (q >= 0) maxSide = when (q) { 0 -> 1280; 1 -> 1800; else -> Int.MAX_VALUE }
+    }
+
+    private fun invalidate() {
+        lastItems = null
+        lastCleanSig = null
+        dirty = true
     }
 
     private fun setRecognizer(script: String?) {
@@ -191,14 +216,28 @@ class OverlayService : Service() {
         screenH = b.height()
     }
 
+    // ---------- screen frames ----------
+
     private fun newReader(): ImageReader {
         val r = ImageReader.newInstance(screenW, screenH, PixelFormat.RGBA_8888, 3)
         r.setOnImageAvailableListener({ rd ->
             val img = rd.acquireLatestImage() ?: return@setOnImageAvailableListener
             latest?.close()
             latest = img
+            frameCount++
         }, handler)
         return r
+    }
+
+    // Recreate the capture surface (used if frames ever stop arriving)
+    private fun resetReader() {
+        val vd = vDisplay ?: return
+        latest?.close(); latest = null
+        val old = reader
+        val r = newReader()
+        reader = r
+        vd.surface = r.surface
+        old?.close()
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -212,6 +251,51 @@ class OverlayService : Service() {
         vd.resize(screenW, screenH, resources.displayMetrics.densityDpi)
         vd.surface = r.surface
         old?.close()
+        invalidate()
+    }
+
+    private fun toBitmap(img: Image): Bitmap {
+        val p = img.planes[0]
+        val pixelStride = p.pixelStride
+        val rowPadding = p.rowStride - pixelStride * img.width
+        val wide = Bitmap.createBitmap(img.width + rowPadding / pixelStride, img.height, Bitmap.Config.ARGB_8888)
+        val buf = p.buffer
+        buf.rewind()   // IMPORTANT: the same frame can be read more than once
+        wide.copyPixelsFromBuffer(buf)
+        val out = Bitmap.createBitmap(wide, 0, 0, img.width, img.height)
+        if (out !== wide) wide.recycle()
+        return out
+    }
+
+    // Tiny fingerprint of the screen (cheap) used to notice that something changed
+    private fun signature(img: Image): IntArray {
+        val p = img.planes[0]
+        val buf = p.buffer
+        val rs = p.rowStride
+        val ps = p.pixelStride
+        val w = img.width
+        val h = img.height
+        val out = IntArray(SIG_W * SIG_H)
+        var k = 0
+        for (gy in 0 until SIG_H) {
+            val y = (gy * h) / SIG_H + h / (2 * SIG_H)
+            for (gx in 0 until SIG_W) {
+                val x = (gx * w) / SIG_W + w / (2 * SIG_W)
+                val i = y * rs + x * ps
+                val r = buf.get(i).toInt() and 0xFF
+                val g = buf.get(i + 1).toInt() and 0xFF
+                val b = buf.get(i + 2).toInt() and 0xFF
+                out[k++] = (r + g + b) / 3
+            }
+        }
+        return out
+    }
+
+    private fun changed(a: IntArray?, b: IntArray?): Boolean {
+        if (a == null || b == null) return true
+        var n = 0
+        for (i in a.indices) if (abs(a[i] - b[i]) > 40) n++
+        return n * 100 > a.size   // more than 1% of the sampled points differ
     }
 
     // ---------- floating button ----------
@@ -234,7 +318,9 @@ class OverlayService : Service() {
         val lp = WindowManager.LayoutParams(
             size, size,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
@@ -249,6 +335,7 @@ class OverlayService : Service() {
 
         tv.setOnTouchListener { _, e ->
             when (e.actionMasked) {
+                MotionEvent.ACTION_OUTSIDE -> onScreenTouched()
                 MotionEvent.ACTION_DOWN -> {
                     downX = e.rawX; downY = e.rawY
                     startX = lp.x; startY = lp.y
@@ -294,40 +381,56 @@ class OverlayService : Service() {
         if (live) stopLive() else startLive()
     }
 
-    // ---------- live translation loop ----------
+    // The user touched something outside our button (probably scrolling/tapping)
+    private fun onScreenTouched() {
+        if (!live) return
+        dirty = true
+        hideOverlays()
+    }
+
+    // ---------- live translation ----------
 
     private fun startLive() {
         if (live) return
         live = true
         buttonBg?.setColor(GREEN)
         ensureLayer()
+        invalidate()
+        shownAt = System.currentTimeMillis()
         toast("Live translation ON")
         liveJob = scope.launch {
-            var prevSig = ""
-            var same = 0
             while (isActive) {
                 try {
-                    val bmp = captureClean()
-                    if (bmp != null) {
-                        val items = analyze(bmp)
-                        bmp.recycle()
-                        if (items != null) {
-                            render(items)
-                            val sig = items.joinToString("|") { "${it.rect.left / 24},${it.rect.top / 24},${it.text}" }
-                            if (sig == prevSig) same++ else { same = 0; prevSig = sig }
+                    val img = latest
+                    if (img != null) {
+                        val now = System.currentTimeMillis()
+                        val sig = signature(img)
+                        if (refSig == null && now - shownAt > 350) refSig = sig
+                        val changedNow = refSig != null && changed(refSig, sig)
+                        if (dirty || changedNow || lastItems == null || now - shownAt > VERIFY_MS) {
+                            scanOnce()
+                            refSig = null
                         }
                     }
+                } catch (e: TimeoutCancellationException) {
+                    lastError = "Translation took too long"
+                    recover()
+                    delay(800)
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Exception) {
-                    lastError = e.message
+                    lastError = e.message ?: e.javaClass.simpleName
+                    recover()
+                    delay(1000)
                 }
                 val err = lastError
-                if (err != null && System.currentTimeMillis() - errorToastAt > 5000) {
-                    errorToastAt = System.currentTimeMillis()
+                val now2 = System.currentTimeMillis()
+                if (err != null && now2 - errorToastAt > 5000) {
+                    errorToastAt = now2
+                    lastError = null
                     toast(err)
                 }
-                delay(if (same >= 3) 1000L else 100L)
+                delay(150)
             }
         }
     }
@@ -337,45 +440,115 @@ class OverlayService : Service() {
         liveJob?.cancel()
         liveJob = null
         clearResults()
+        shown = false
+        dirty = false
+        cleanPending = false
+        lastItems = null
+        lastCleanSig = null
+        refSig = null
         buttonBg?.setColor(BLUE)
         toast("Live translation OFF")
     }
 
-    // Hide our own overlay for a moment so the screenshot contains only the real app
-    private suspend fun captureClean(): Bitmap? {
-        if (latest == null) return null
-        val layer = resultLayer
-        val hide = pool.any { it.visibility == View.VISIBLE }
-        if (layer != null && hide) {
+    private fun hideOverlays() {
+        val layer = resultLayer ?: return
+        if (!shown) return
+        layer.animate().cancel()
+        layer.alpha = 0f
+        shown = false
+        hideFrame = frameCount
+        cleanPending = true
+    }
+
+    private fun showOverlays() {
+        val layer = resultLayer ?: return
+        val any = pool.any { it.visibility == View.VISIBLE }
+        layer.animate().cancel()
+        if (any) {
             layer.alpha = 0f
-            delay(110)
+            layer.animate().alpha(1f).setDuration(120).start()
         }
-        val bmp = try { latest?.let { toBitmap(it) } } catch (e: Exception) { null }
-        layer?.alpha = 1f
-        return bmp
+        shown = any
+        shownAt = System.currentTimeMillis()
     }
 
-    private fun toBitmap(img: Image): Bitmap {
-        val p = img.planes[0]
-        val pixelStride = p.pixelStride
-        val rowPadding = p.rowStride - pixelStride * img.width
-        val wide = Bitmap.createBitmap(img.width + rowPadding / pixelStride, img.height, Bitmap.Config.ARGB_8888)
-        wide.copyPixelsFromBuffer(p.buffer)
-        val out = Bitmap.createBitmap(wide, 0, 0, img.width, img.height)
-        if (out !== wide) wide.recycle()
-        return out
+    private fun recover() {
+        val layer = resultLayer ?: return
+        layer.animate().cancel()
+        layer.alpha = 1f
+        shown = pool.any { it.visibility == View.VISIBLE }
+        cleanPending = false
+        shownAt = System.currentTimeMillis()
+        if (lastItems == null) lastItems = emptyList()
     }
 
-    private suspend fun analyze(bmp: Bitmap): List<Item>? {
+    private suspend fun scanOnce() {
+        dirty = false
+        if (shown) hideOverlays()
+
+        // wait until the screen shows the real app without our translations on top
+        if (cleanPending) {
+            var waited = 0
+            while (frameCount == hideFrame && waited < 400) { delay(16); waited += 16 }
+            if (frameCount == hideFrame) { resetReader(); delay(200) }   // frames stalled -> restart capture
+            delay(50)
+            cleanPending = false
+        }
+
+        val first = latest ?: return
+        val sigA = signature(first)
+        if (lastItems != null && !changed(lastCleanSig, sigA)) {
+            showOverlays()          // nothing changed: just bring the translations back
+            return
+        }
+
+        // wait until scrolling / animation stops (max 3 seconds)
+        var prev = sigA
+        var stable = 0
+        var t = 0
+        while (stable < 2 && t < 3000) {
+            delay(110); t += 110
+            val cur = latest?.let { signature(it) } ?: break
+            if (changed(prev, cur)) stable = 0 else stable++
+            prev = cur
+        }
+
+        val img = latest ?: return
+        val sigClean = signature(img)
+        val full = toBitmap(img)
+        val side = maxOf(full.width, full.height)
+        val scale = if (side <= maxSide) 1f else maxSide.toFloat() / side
+        val bmp = if (scale < 1f)
+            Bitmap.createScaledBitmap(full, (full.width * scale).toInt(), (full.height * scale).toInt(), true)
+                .also { if (it !== full) full.recycle() }
+        else full
+
+        val items = try {
+            withTimeout(15000) { analyze(bmp, scale) }
+        } finally {
+            bmp.recycle()
+        }
+        if (items != null) {
+            render(items)
+            lastItems = items
+            lastCleanSig = sigClean
+        }
+        showOverlays()
+    }
+
+    private suspend fun analyze(bmp: Bitmap, scale: Float): List<Item>? {
         val rec = recognizer ?: return null
         val result = withContext(Dispatchers.Default) {
             rec.process(InputImage.fromBitmap(bmp, 0)).await()
         }
-        lastError = null
         val skip = buttonRect().apply { inset(-20, -20) }
         val items = ArrayList<Item>()
         for (block in result.textBlocks) {
-            val rect = block.boundingBox ?: continue
+            val r0 = block.boundingBox ?: continue
+            val rect = if (scale < 1f) Rect(
+                (r0.left / scale).toInt(), (r0.top / scale).toInt(),
+                (r0.right / scale).toInt(), (r0.bottom / scale).toInt()
+            ) else r0
             if (Rect.intersects(rect, skip)) continue
             val src = block.lines.joinToString(" ") { it.text }.trim()
             if (src.length < 2) continue
@@ -473,20 +646,14 @@ class OverlayService : Service() {
 
     private fun render(items: List<Item>) {
         val layer = resultLayer ?: return
-        val unused = pool.toMutableList()
-        for (item in items) {
-            val tv = unused.firstOrNull { it.visibility == View.VISIBLE && it.text.toString() == item.text }
-                ?: unused.firstOrNull { it.visibility == View.GONE }
-                ?: unused.firstOrNull()
-                ?: newPoolView(layer)
-            unused.remove(tv)
-            val keep = tv.visibility == View.VISIBLE && tv.text.toString() == item.text
-            place(tv, item, keep)
+        for ((i, item) in items.withIndex()) {
+            val tv = if (i < pool.size) pool[i] else newPoolView(layer)
+            place(tv, item)
         }
-        unused.forEach { it.visibility = View.GONE }
+        for (j in items.size until pool.size) pool[j].visibility = View.GONE
     }
 
-    private fun place(tv: TextView, item: Item, animate: Boolean) {
+    private fun place(tv: TextView, item: Item) {
         val lineH = item.rect.height().toFloat() / item.lines.coerceAtLeast(1)
         tv.text = item.text
         tv.setTextSize(TypedValue.COMPLEX_UNIT_PX, (lineH * 0.65f).coerceIn(22f, 64f))
@@ -496,16 +663,9 @@ class OverlayService : Service() {
             lp.width = item.rect.width()
             tv.layoutParams = lp
         }
+        tv.translationX = item.rect.left.toFloat()
+        tv.translationY = item.rect.top.toFloat()
         tv.visibility = View.VISIBLE
-        tv.animate().cancel()
-        val x = item.rect.left.toFloat()
-        val y = item.rect.top.toFloat()
-        if (animate) {
-            tv.animate().translationX(x).translationY(y).setDuration(90).start()
-        } else {
-            tv.translationX = x
-            tv.translationY = y
-        }
     }
 
     private fun clearResults() {

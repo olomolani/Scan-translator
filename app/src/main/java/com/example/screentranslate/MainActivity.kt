@@ -51,6 +51,12 @@ class MainActivity : Activity() {
 
     private lateinit var srcSpinner: Spinner
     private lateinit var tgtSpinner: Spinner
+    private lateinit var qualitySpinner: Spinner
+    private val qualities = listOf(
+        "Fast (lighter, less accurate on tiny text)",
+        "Balanced",
+        "Sharp (slower, best for small Chinese/Japanese text)"
+    )
     private val prefs by lazy { getSharedPreferences("cfg", MODE_PRIVATE) }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -76,13 +82,21 @@ class MainActivity : Activity() {
         }
         root.addView(tgtSpinner)
 
+        root.addView(label("OCR speed:"))
+        qualitySpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, qualities)
+        }
+        root.addView(qualitySpinner)
+
         srcSpinner.setSelection(prefs.getInt("src2", 0).coerceIn(0, sources.size - 1))
+        qualitySpinner.setSelection(prefs.getInt("q", 1).coerceIn(0, qualities.size - 1))
         tgtSpinner.setSelection(prefs.getInt("tgt", 0).coerceIn(0, targets.size - 1))
         val changed = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(p: AdapterView<*>?, v: View?, pos: Int, id: Long) {
                 prefs.edit()
                     .putInt("src2", srcSpinner.selectedItemPosition)
                     .putInt("tgt", tgtSpinner.selectedItemPosition)
+                    .putInt("q", qualitySpinner.selectedItemPosition)
                     .apply()
                 sendConfig()
             }
@@ -90,6 +104,7 @@ class MainActivity : Activity() {
         }
         srcSpinner.onItemSelectedListener = changed
         tgtSpinner.onItemSelectedListener = changed
+        qualitySpinner.onItemSelectedListener = changed
 
         root.addView(Button(this).apply {
             text = "Start floating button"
@@ -97,6 +112,7 @@ class MainActivity : Activity() {
         })
         root.addView(TextView(this).apply {
             text = "Tap the floating button to turn LIVE translation on (it turns green). Tap again to turn it off. " +
+                "Translations stay still while the screen is still, hide while you scroll, and come back when it stops. " +
                 "Long-press (1.5s) the button to quit.\n\n" +
                 "To change languages while it is running: open this app and pick another language - it applies instantly.\n\n" +
                 "Live mode uses battery. Turn it off when you do not need it."
@@ -113,6 +129,7 @@ class MainActivity : Activity() {
         val s = sources[srcSpinner.selectedItemPosition]
         return i.putExtra("script", s.script)
             .putExtra("latin", s.latin)
+            .putExtra("quality", qualitySpinner.selectedItemPosition)
             .putExtra("target", targets[tgtSpinner.selectedItemPosition].second)
     }
 
